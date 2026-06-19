@@ -1,0 +1,19 @@
+{
+  "name": "attendx-agent",
+  "version": "1.0.0",
+  "description": "AttendX Local Agent — Syncs ESSL K30 Pro machines to Supabase",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "postinstall": "node patches/apply-zklib-patch.js",
+    "install-service": "node install-service.js",
+    "uninstall-service": "node uninstall-service.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.0",
+    "node-zklib": "^1.1.4",
+    "dotenv": "^16.4.5",
+    "node-windows": "^1.0.0-beta.8",
+    "node-cron": "^3.0.3"
+  }
+}
