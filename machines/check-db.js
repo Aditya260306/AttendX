@@ -4,6 +4,10 @@ const { createClient } = require('@supabase/supabase-js');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
 async function check() {
+    const { data: users } = await supabase.from('device_users').select('*').limit(5);
+    console.log('--- DEVICE USERS ---');
+    console.table(users);
+
     const { data: devices } = await supabase.from('devices').select('*');
     console.log('--- DEVICES IN DATABASE ---');
     console.table(devices);
