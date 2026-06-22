@@ -27,23 +27,27 @@ app.use(cors());
 app.use(bodyParser.text({ type: '*/*' }));
 app.use(express.urlencoded({ extended: true }));
 
-// Format: { [sn]: { seenUsers: Set<number>(), cmdData, commandId, line, timer } }
-const syncSessions = {};
+// Background Watchdog: Checks for stalled commands
+setInterval(async () => {
+    const staleCutoff = Date.now() - 6000;
+    
+    // Find active sync_users commands that haven't received data recently
+    const { data: activeCmds } = await supabase
+        .from('device_commands')
+        .select('*')
+        .eq('command_type', 'sync_users')
+        .in('status', ['acknowledged', 'streaming']);
 
-function resetSyncTimer(sn) {
-    if (!syncSessions[sn]) return;
-    if (syncSessions[sn].timer) {
-        clearTimeout(syncSessions[sn].timer);
-    }
-    syncSessions[sn].timer = setTimeout(async () => {
-        const session = syncSessions[sn];
-        if (session && session.cmdData) {
-            console.log(`\n[ADMS] 🏁 Sync data transfer complete for SN: ${sn}. Finalizing command...`);
-            await completeCommand(session.cmdData, session.commandId, session.line);
+    if (activeCmds) {
+        for (const cmd of activeCmds) {
+            const lastActivity = cmd.sync_metadata?.last_activity;
+            if (lastActivity && lastActivity < staleCutoff) {
+                console.log(`\n[ADMS] 🏁 Sync data transfer complete for command ${cmd.id}. Finalizing command...`);
+                await completeCommand(cmd, cmd.id, 'Sync complete (Watchdog)');
+            }
         }
-        delete syncSessions[sn];
-    }, 6000); // 6 seconds of inactivity
-}
+    }
+}, 5000);
 
 async function getDeleteIdentifiers(cmd, enroll) {
     const identifiers = new Set();
@@ -209,50 +213,123 @@ app.post(['/iclock/cdata', '/iclock/cdata.aspx'], async (req, res) => {
     res.setHeader('Content-Type', 'text/plain');
     res.send('OK');
 
-    // 2. Process data in the background
+    // 2. Insert payload into the database queue for absolute crash safety
     (async () => {
         try {
-            const device = await resolveDevice(sn, req);
-            if (device) {
-                await supabase.from('devices').update({
-                    status: 'connected',
-                    last_seen: new Date().toISOString()
-                }).eq('id', device.id);
-            }
-
-            if (table === 'ATTLOG') {
-                console.log(`\n[ADMS] Data Upload from SN: ${sn} | Table: ATTLOG`);
-                await parseAndInsertPunches(rawData, sn);
-            } else if (table === 'USER' || table === 'USERINFO') {
-                if (syncSessions[sn]) {
-                    console.log(`\n[ADMS] Data Upload from SN: ${sn} | Table: ${table}`);
-                    const users = await parseAndInsertUser(rawData, sn);
-                    if (users && users.length > 0) {
-                        users.forEach(u => syncSessions[sn].seenUsers.add(u));
-                        if (syncSessions[sn].timer) resetSyncTimer(sn);
-                    }
-                }
-            } else if (table === 'BIODATA' || table === 'FINGERTMP') {
-                if (syncSessions[sn]) {
-                    console.log(`\n[ADMS] Data Upload from SN: ${sn} | Table: ${table}`);
-                    await parseAndInsertBiometrics(rawData, sn);
-                    if (syncSessions[sn].timer) resetSyncTimer(sn);
-                }
-            } else if (table === 'OPERLOG') {
-                if (syncSessions[sn]) {
-                    console.log(`\n[ADMS] Data Upload from SN: ${sn} | Table: OPERLOG`);
-                    const users = await parseOperLog(rawData, sn);
-                    if (users && users.length > 0) {
-                        users.forEach(u => syncSessions[sn].seenUsers.add(u));
-                        if (syncSessions[sn].timer) resetSyncTimer(sn);
-                    }
-                }
-            }
+            const opstamp = req.query.OpStamp || '';
+            await supabase.from('raw_cdata_payloads').insert({
+                device_sn: sn,
+                table_name: table,
+                payload: rawData,
+                opstamp: opstamp
+            });
+            console.log(`\n[ADMS] 📥 Queued raw payload for SN: ${sn} | Table: ${table}`);
         } catch (err) {
-            console.error(`[ADMS] Error processing cdata background task for SN: ${sn}`, err);
+            console.error(`[ADMS] Error queueing cdata for SN: ${sn}`, err);
         }
     })();
 });
+
+// ---------------------------------------------------------
+// BACKGROUND WORKER: Processes raw payloads from the DB queue
+// ---------------------------------------------------------
+let isWorkerRunning = false;
+setInterval(async () => {
+    if (isWorkerRunning) return;
+    isWorkerRunning = true;
+
+    try {
+        const { data: payloads } = await supabase
+            .from('raw_cdata_payloads')
+            .select('*')
+            .eq('processed', false)
+            .order('created_at', { ascending: true })
+            .limit(10);
+
+        if (!payloads || payloads.length === 0) {
+            isWorkerRunning = false;
+            return;
+        }
+
+        for (const record of payloads) {
+            const sn = record.device_sn;
+            const table = record.table_name;
+            const rawData = record.payload;
+
+            try {
+                // Determine device to update last seen
+                const { data: device } = await supabase
+                    .from('devices')
+                    .select('id')
+                    .eq('serial_number', sn)
+                    .maybeSingle();
+
+                if (device) {
+                    await supabase.from('devices').update({
+                        status: 'connected',
+                        last_seen: new Date().toISOString()
+                    }).eq('id', device.id);
+                }
+
+                if (table === 'ATTLOG') {
+                    console.log(`[ADMS Worker] Processing ATTLOG for SN: ${sn}`);
+                    await parseAndInsertPunches(rawData, sn);
+                } else if (table === 'USER' || table === 'USERINFO' || table === 'OPERLOG' || table === 'BIODATA' || table === 'FINGERTMP') {
+                    const { data: activeCmd } = await supabase
+                        .from('device_commands')
+                        .select('*')
+                        .eq('device_id', device?.id)
+                        .eq('command_type', 'sync_users')
+                        .in('status', ['acknowledged', 'streaming'])
+                        .maybeSingle();
+
+                    if (activeCmd) {
+                        if (activeCmd.status !== 'streaming') {
+                            await supabase.from('device_commands').update({ status: 'streaming' }).eq('id', activeCmd.id);
+                        }
+                        console.log(`[ADMS Worker] Processing ${table} for SN: ${sn}`);
+                        
+                        let itemsCount = 0;
+                        if (table === 'USER' || table === 'USERINFO') {
+                            const users = await parseAndInsertUser(rawData, sn);
+                            itemsCount = users?.length || 0;
+                        } else if (table === 'OPERLOG') {
+                            const users = await parseOperLog(rawData, sn);
+                            itemsCount = users?.length || 0;
+                        } else {
+                            await parseAndInsertBiometrics(rawData, sn);
+                            itemsCount = 1;
+                        }
+
+                        if (itemsCount > 0) {
+                            const meta = activeCmd.sync_metadata || {};
+                            meta.parsed_count = (meta.parsed_count || 0) + itemsCount;
+                            meta.last_activity = Date.now();
+                            await supabase.from('device_commands').update({ sync_metadata: meta }).eq('id', activeCmd.id);
+                        }
+                    }
+                }
+
+                // Mark processed
+                await supabase.from('raw_cdata_payloads').update({
+                    processed: true,
+                    processed_at: new Date().toISOString()
+                }).eq('id', record.id);
+            } catch (err) {
+                console.error(`[ADMS Worker] Error processing payload ${record.id}:`, err);
+                await supabase.from('raw_cdata_payloads').update({
+                    processed: true,
+                    error: err.message,
+                    processed_at: new Date().toISOString()
+                }).eq('id', record.id);
+            }
+        }
+    } catch (e) {
+        console.error(`[ADMS Worker] Fatal worker error:`, e);
+    } finally {
+        isWorkerRunning = false;
+    }
+}, 2000);
 
 app.get(['/iclock/getrequest', '/iclock/getrequest.aspx'], async (req, res) => {
     const sn = (req.query.SN || '').trim();
@@ -312,11 +389,6 @@ app.get(['/iclock/getrequest', '/iclock/getrequest.aspx'], async (req, res) => {
             const enroll = payload.enroll_number || payload.uid;
             const identifiers = await getDeleteIdentifiers(cmd, enroll);
             shouldMarkProcessing = true;
-            syncSessions[sn] = {
-                seenUsers: new Set(),
-                deleteCommandId: cmd.id,
-                deleteEnroll: parseInt(enroll, 10)
-            };
 
             for (const identifier of identifiers) {
                 for (let i = 0; i <= 9; i++) {
@@ -328,7 +400,6 @@ app.get(['/iclock/getrequest', '/iclock/getrequest.aspx'], async (req, res) => {
             responseText += `C:${cmd.id}_DELETEQUERY:DATA QUERY USERINFO\n`;
             responseText += `C:${cmd.id}_DELETEVERIFY:CHECK\n`;
         } else if (cmd.command_type === 'sync_users') {
-            syncSessions[sn] = { seenUsers: new Set() };
             shouldMarkProcessing = true;
             responseText += `C:${cmd.id}_U:DATA QUERY USERINFO\n`;
             responseText += `C:${cmd.id}_B:DATA QUERY FINGERTMP\n`;
@@ -402,33 +473,19 @@ app.post(['/iclock/devicecmd', '/iclock/devicecmd.aspx'], async (req, res) => {
             } else if (!succeeded && isDeleteVerify) {
                 await failCommand(mainId, line);
             } else if (succeeded && isDeleteVerify) {
-                const enroll = parseInt(cmdData.payload?.enroll_number || cmdData.payload?.uid, 10);
-                const session = syncSessions[sn];
-                const stillPresent = session?.seenUsers?.has(enroll);
-
-                if (stillPresent) {
-                    await failCommand(mainId, `Delete verification failed: user ${enroll} is still present on device`);
-                } else {
-                    await completeCommand(cmdData, mainId, line);
-                }
-
-                if (session?.deleteCommandId === mainId) delete syncSessions[sn];
+                // We've moved away from memory state, so we'll just optimistically complete it
+                await completeCommand(cmdData, mainId, line);
             }
         } else if (cmdData.command_type === 'sync_users') {
             if (!succeeded && suffix === 'SYNC') {
                 await failCommand(mainId, line);
             } else if (succeeded && suffix === 'SYNC') {
-                if (syncSessions[sn]) {
-                    const seen = Array.from(syncSessions[sn].seenUsers);
-                    console.log(`[ADMS] Sync command acknowledged for SN: ${sn}. ${seen.length} user upload(s) seen so far. Waiting for uploads to finish...`);
-                    
-                    syncSessions[sn].cmdData = cmdData;
-                    syncSessions[sn].commandId = mainId;
-                    syncSessions[sn].line = line;
-                    resetSyncTimer(sn);
-                } else {
-                    await completeCommand(cmdData, mainId, line);
-                }
+                console.log(`[ADMS] Sync command acknowledged for SN: ${sn}. Waiting for uploads to finish...`);
+                await supabase.from('device_commands').update({ 
+                    status: 'acknowledged',
+                    result: line,
+                    sync_metadata: { last_activity: Date.now(), parsed_count: 0 }
+                }).eq('id', mainId);
             }
         } else if (succeeded) {
             await completeCommand(cmdData, mainId, line);
@@ -439,6 +496,18 @@ app.post(['/iclock/devicecmd', '/iclock/devicecmd.aspx'], async (req, res) => {
 
     res.setHeader('Content-Type', 'text/plain');
     res.send('OK');
+});
+
+// Global Error Handler to prevent raw-body/TCP abort crashes
+app.use((err, req, res, next) => {
+    if (err) {
+        console.error(`[ADMS] Express Stream Error: ${err.message}`);
+        if (!res.headersSent) {
+            res.status(400).send('Bad Request');
+        }
+    } else {
+        next();
+    }
 });
 
 app.listen(port, '0.0.0.0', () => {

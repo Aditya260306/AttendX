@@ -52,7 +52,7 @@ export function buildRoster(employees, punches, holidays, rules, dateRange) {
   const shiftStartMins = timeToMins(shiftStart);
 
   return employees
-    .filter(emp => emp.is_active !== false)
+    .filter(emp => !emp.is_deleted)
     .map(emp => {
       const en = emp.enroll_number;
       // Per-employee shift override

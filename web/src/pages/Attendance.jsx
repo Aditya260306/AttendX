@@ -29,8 +29,7 @@ export default function Attendance() {
   const [employees, setEmployees] = useState([]);
   const [punches, setPunches] = useState([]);
   const [holidays, setHolidays] = useState([]);
-  const [rules, setRules] = useState(null);
-  const [devices, setDevices] = useState([]);
+    const [devices, setDevices] = useState([]);
   const [loading, setLoading] = useState(true);
 
   const [startDate, setStartDate] = useState(() => {
@@ -51,14 +50,7 @@ export default function Attendance() {
   const lastClickedRef = useRef(null); // { empIdx, dayIdx } for shift-click range
   const [bulkModal, setBulkModal] = useState(null); // { inTime, outTime } for bulk modify
 
-  // ─── Optimistic UI ──────────────────────────────────────
-  // localOverrides: Map<cellKey, { status, checkIn, checkOut }> — instant visual feedback
-  const [localOverrides, setLocalOverrides] = useState(() => {
-    try { const s = localStorage.getItem('attn_overrides'); return s ? new Map(JSON.parse(s)) : new Map(); }
-    catch { return new Map(); }
-  });
-  const [syncStatus, setSyncStatus] = useState({ total: 0, done: 0, failed: 0, active: false });
-  const syncAbortRef = useRef(false);
+  // ─── Optimistic UI State Removed (Using Realtime) ──────
   const [sortConfig, setSortConfig] = useState({ key: 'name', dir: 'asc' }); // key: 'name'|'id'|'device', dir: 'asc'|'desc'
 
   // Context menu
@@ -66,10 +58,8 @@ export default function Attendance() {
   // Punch edit modal
   const [editModal, setEditModal] = useState(null);
   // Details modal (audit trail)
-  const [detailsModal, setDetailsModal] = useState(null); // { enroll, dateStr, name, logs:[] }
-  // Modification records
-  const [modifications, setModifications] = useState([]); // punch_modifications rows
-  // Employee profile modal
+    // Modification records
+    // Employee profile modal
   const [profileModal, setProfileModal] = useState(null); // { enrollNumber }
   // 3-dot menu for employee row
   const [empMenu, setEmpMenu] = useState(null); // { enrollNumber }
@@ -88,35 +78,41 @@ export default function Attendance() {
     const startStr = startDate + ' 00:00:00';
     const endStr = endDate + ' 23:59:59';
 
-    const [empRes, punchRes, holRes, rulesRes, devRes, modsRes] = await Promise.all([
-      supabase.from('employees').select('enroll_number, name, department, designation, shift_start, shift_end, is_active, track_attendance, primary_device_id, joining_date, base_salary').order('name'),
+    const [empRes, punchRes, holRes, devRes] = await Promise.all([
+      supabase.from('employees').select('enroll_number, name, department, designation, shift_start, shift_end, is_deleted, track_attendance, primary_device_id, joining_date, base_salary').order('name'),
       supabase.from('raw_punches')
         .select('enroll_number, punch_time, device_id, is_deleted')
         .gte('punch_time', startStr)
         .lte('punch_time', endStr)
         .order('punch_time'),
       supabase.from('holidays').select('*'),
-      supabase.from('attendance_rules').select('*').limit(1).single(),
       supabase.from('devices').select('id, name').eq('is_active', true),
-      supabase.from('punch_modifications')
-        .select('*')
-        .gte('punch_date', startDate)
-        .lte('punch_date', endDate)
-        .order('modified_at', { ascending: false }),
     ]);
 
-    const trackableEmps = (empRes.data || []).filter(e => e.track_attendance !== false);
+    const trackableEmps = (empRes.data || []).filter(e => e.track_attendance !== false && e.is_deleted === false);
     setEmployees(trackableEmps);
     setPunches(punchRes.data || []);
-    console.log('[fetchData] punches:', (punchRes.data || []).length, 'mods:', (modsRes.data || []).length);
+    console.log('[fetchData] punches:', (punchRes.data || []).length);
     setHolidays(holRes.data || []);
-    setRules(rulesRes.data || null);
-    setDevices(devRes.data || []);
-    setModifications(modsRes.data || []);
-    setLoading(false);
+        setDevices(devRes.data || []);
+        setLoading(false);
   }, [startDate, endDate]);
 
-  useEffect(() => { fetchData(); }, [fetchData]);
+  useEffect(() => {
+    fetchData();
+    
+    // Subscribe to realtime punches
+    const channel = supabase.channel('punches_realtime')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'raw_punches' }, (payload) => {
+        console.log('[Realtime] raw_punches event:', payload);
+        fetchData(); // Simplest way to recalculate roster reliably
+      })
+      .subscribe();
+      
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [fetchData]);
 
   // ─── Roster Computation ────────────────────────────────
   const activePunches = useMemo(() => {
@@ -127,17 +123,12 @@ export default function Attendance() {
     return filtered;
   }, [punches, deviceFilter]);
 
-  // Set of modified cells: 'enrollNumber:YYYY-MM-DD'
-  const modSet = useMemo(() => {
-    const s = new Set();
-    for (const m of modifications) s.add(`${m.enroll_number}:${m.punch_date}`);
-    return s;
-  }, [modifications]);
+  // Set of modified cells removed (no longer highlighting them manually to reduce complexity)
 
   const roster = useMemo(() => {
     if (!employees.length || !dateRange.length) return [];
-    return buildRoster(employees, activePunches, holidays, rules, dateRange);
-  }, [employees, activePunches, holidays, rules, dateRange]);
+    return buildRoster(employees, activePunches, holidays, null, dateRange);
+  }, [employees, activePunches, holidays, dateRange]);
 
   const filteredRoster = useMemo(() => {
     let result = roster;
@@ -239,71 +230,22 @@ export default function Attendance() {
     return items;
   }
 
-  // ─── Optimistic Helpers ─────────────────────────────────
-  function applyOverrides(items, action, inTime, outTime) {
-    setLocalOverrides(prev => {
-      const next = new Map(prev);
-      for (const { enrollNumber, dateStr } of items) {
-        const key = `${enrollNumber}:${dateStr}`;
-        if (action === 'mark_absent') {
-          next.set(key, { status: 'A', checkIn: null, checkOut: null });
-        } else if (action === 'mark_present') {
-          const emp = employees.find(e => e.enroll_number === enrollNumber);
-          const eIn = emp?.shift_start?.substring(0, 5) || rules?.shift_start?.substring(0, 5) || '09:00';
-          const eOut = emp?.shift_end?.substring(0, 5) || rules?.shift_end?.substring(0, 5) || '18:00';
-          next.set(key, { status: 'P', checkIn: eIn, checkOut: eOut });
-        } else if (action === 'modify') {
-          next.set(key, { status: inTime ? 'P' : 'A', checkIn: inTime || null, checkOut: outTime || null });
-        }
-      }
-      try { localStorage.setItem('attn_overrides', JSON.stringify([...next])); } catch {}
-      return next;
-    });
-  }
-
+  // ─── Simplified Syncing ─────────────────────────────────
   async function runBulkSync(items, execFn) {
-    setSyncStatus({ total: items.length, done: 0, failed: 0, active: true });
-    syncAbortRef.current = false;
-
-    // Fire all in parallel (each cell's ops are internally sequential)
-    const promises = items.map(async (item, idx) => {
+    const promises = items.map(async (item) => {
       try {
         await execFn(item);
-        setSyncStatus(s => ({ ...s, done: s.done + 1 }));
       } catch (err) {
         console.error('Sync failed for', item, err);
-        setSyncStatus(s => ({ ...s, done: s.done + 1, failed: s.failed + 1 }));
       }
     });
-
     await Promise.allSettled(promises);
-
-    // Reconcile: clear overrides, fetch real data
-    setLocalOverrides(new Map());
-    try { localStorage.removeItem('attn_overrides'); } catch {}
     await fetchData();
-
-    // Brief success flash before hiding
-    setSyncStatus(s => ({ ...s, active: 'done' }));
-    setTimeout(() => setSyncStatus({ total: 0, done: 0, failed: 0, active: false }), 2000);
   }
-
-  // beforeunload: warn if sync in progress
-  useEffect(() => {
-    const handler = (e) => {
-      if (syncStatus.active && syncStatus.active !== 'done') {
-        e.preventDefault();
-        e.returnValue = 'Changes are still syncing. Are you sure?';
-      }
-    };
-    window.addEventListener('beforeunload', handler);
-    return () => window.removeEventListener('beforeunload', handler);
-  }, [syncStatus.active]);
 
   async function bulkMarkPresent() {
     const items = getSelectedItems();
     if (items.length === 0) return;
-    applyOverrides(items, 'mark_present');
     clearSelection();
     await runBulkSync(items, ({ enrollNumber, dateStr, day }) => _doMarkPresent(enrollNumber, dateStr, day));
   }
@@ -311,7 +253,6 @@ export default function Attendance() {
   async function bulkMarkAbsent() {
     const items = getSelectedItems();
     if (items.length === 0) return;
-    applyOverrides(items, 'mark_absent');
     clearSelection();
     await runBulkSync(items, ({ enrollNumber, dateStr, day }) => _doMarkAbsent(enrollNumber, dateStr, day));
   }
@@ -321,19 +262,13 @@ export default function Attendance() {
     const items = getSelectedItems();
     if (items.length === 0) return;
     const { inTime, outTime } = bulkModal;
-    applyOverrides(items, 'modify', inTime, outTime);
     setBulkModal(null);
     clearSelection();
 
     await runBulkSync(items, async ({ enrollNumber, dateStr, day, emp }) => {
       const deviceId = emp.primary_device_id || (devices.length > 0 ? devices[0].id : null);
-      await supabase.from('punch_modifications').insert({
-        enroll_number: enrollNumber, punch_date: dateStr, action_type: 'modify',
-        original_in_time: day.checkIn || null, original_out_time: day.checkOut || null,
-        new_in_time: inTime ? inTime + ':00' : null, new_out_time: outTime ? outTime + ':00' : null,
-        modified_by: 'admin',
-      });
-      await supabase.from('raw_punches').update({ is_deleted: false })
+      
+      await supabase.from('raw_punches').update({ is_deleted: false, deleted_at: null, deleted_by: null, delete_reason: null })
         .eq('enroll_number', enrollNumber).gte('punch_time', dateStr + ' 00:00:00').lte('punch_time', dateStr + ' 23:59:59');
       await supabase.from('raw_punches').delete()
         .eq('enroll_number', enrollNumber).gte('punch_time', dateStr + ' 00:00:00').lte('punch_time', dateStr + ' 23:59:59');
@@ -408,19 +343,9 @@ export default function Attendance() {
   // ─── Mark as Absent (soft delete + audit) ─────────────
   // Silent DB-only helper (no UI refresh)
   async function _doMarkAbsent(enrollNumber, dateStr, day) {
-    const { error: auditErr } = await supabase.from('punch_modifications').insert({
-      enroll_number: enrollNumber,
-      punch_date: dateStr,
-      action_type: 'mark_absent',
-      original_in_time: day.checkIn || null,
-      original_out_time: day.checkOut || null,
-      new_in_time: null,
-      new_out_time: null,
-      modified_by: 'admin',
-    });
-    if (auditErr) console.error('markAbsent audit error:', auditErr);
+    
     const { error: updErr } = await supabase.from('raw_punches')
-      .update({ is_deleted: true })
+      .update({ is_deleted: true, deleted_at: new Date().toISOString(), deleted_by: 'admin', delete_reason: 'mark_absent' })
       .eq('enroll_number', enrollNumber)
       .gte('punch_time', dateStr + ' 00:00:00')
       .lte('punch_time', dateStr + ' 23:59:59');
@@ -443,23 +368,14 @@ export default function Attendance() {
   // Silent DB-only helper (no UI refresh)
   async function _doMarkPresent(enrollNumber, dateStr, day) {
     const emp = employees.find(e => e.enroll_number === enrollNumber);
-    const inTime = emp?.shift_start?.substring(0, 5) || rules?.shift_start?.substring(0, 5) || '09:00';
-    const outTime = emp?.shift_end?.substring(0, 5) || rules?.shift_end?.substring(0, 5) || '18:00';
+    const inTime = emp?.shift_start?.substring(0, 5) || '09:00';
+    const outTime = emp?.shift_end?.substring(0, 5) || '18:00';
     const deviceId = emp?.primary_device_id || (devices.length > 0 ? devices[0].id : null);
 
-    await supabase.from('punch_modifications').insert({
-      enroll_number: enrollNumber,
-      punch_date: dateStr,
-      action_type: 'mark_present',
-      original_in_time: day.checkIn || null,
-      original_out_time: day.checkOut || null,
-      new_in_time: inTime + ':00',
-      new_out_time: outTime + ':00',
-      modified_by: 'admin',
-    });
+    
 
     await supabase.from('raw_punches')
-      .update({ is_deleted: false })
+      .update({ is_deleted: false, deleted_at: null, deleted_by: null, delete_reason: null })
       .eq('enroll_number', enrollNumber)
       .gte('punch_time', dateStr + ' 00:00:00')
       .lte('punch_time', dateStr + ' 23:59:59');
@@ -488,85 +404,7 @@ export default function Attendance() {
     }
   }
 
-  // ─── Restore (undo last modification + audit) ──────────
-  async function restorePunch(enrollNumber, dateStr) {
-    try {
-    console.log('[restorePunch]', { enrollNumber, dateStr });
-
-    // Find the most recent non-restore modification
-    const { data: lastMods } = await supabase.from('punch_modifications')
-      .select('*')
-      .eq('enroll_number', enrollNumber)
-      .eq('punch_date', dateStr)
-      .neq('action_type', 'restore')
-      .order('modified_at', { ascending: false })
-      .limit(1);
-    console.log('[restorePunch] lastMods:', lastMods);
-
-    // Log the restore action
-    const { error: auditErr } = await supabase.from('punch_modifications').insert({
-      enroll_number: enrollNumber,
-      punch_date: dateStr,
-      action_type: 'restore',
-      modified_by: 'admin',
-    });
-    if (auditErr) console.error('Restore audit error:', auditErr);
-
-    const last = lastMods?.[0];
-
-    if (last?.action_type === 'mark_absent') {
-      // Case 1: Undo mark_absent → un-soft-delete punches
-      console.log('[restorePunch] undoing mark_absent: un-soft-deleting');
-      const { error: updErr } = await supabase.from('raw_punches')
-        .update({ is_deleted: false })
-        .eq('enroll_number', enrollNumber)
-        .gte('punch_time', dateStr + ' 00:00:00')
-        .lte('punch_time', dateStr + ' 23:59:59');
-      if (updErr) console.error('Restore un-soft-delete error:', updErr);
-
-    } else if (last?.action_type === 'mark_present' && !last.original_in_time) {
-      // Case 2: Undo mark_present on originally-absent cell → delete the inserted punches
-      console.log('[restorePunch] undoing mark_present (was absent): deleting punches');
-      const { error: delErr } = await supabase.from('raw_punches')
-        .delete()
-        .eq('enroll_number', enrollNumber)
-        .gte('punch_time', dateStr + ' 00:00:00')
-        .lte('punch_time', dateStr + ' 23:59:59');
-      if (delErr) console.error('Restore delete error:', delErr);
-
-    } else if (last?.original_in_time) {
-      // Case 3: Undo modify/mark_present with original times → replace with original
-      console.log('[restorePunch] restoring original times:', last.original_in_time, last.original_out_time);
-      const emp = employees.find(e => e.enroll_number === enrollNumber);
-      const deviceId = emp?.primary_device_id || (devices.length > 0 ? devices[0].id : null);
-
-      // Delete current, re-insert originals
-      await supabase.from('raw_punches')
-        .delete()
-        .eq('enroll_number', enrollNumber)
-        .gte('punch_time', dateStr + ' 00:00:00')
-        .lte('punch_time', dateStr + ' 23:59:59');
-
-      const inserts = [
-        { enroll_number: enrollNumber, punch_time: `${dateStr} ${last.original_in_time}`, device_id: deviceId, is_deleted: false },
-      ];
-      if (last.original_out_time) {
-        inserts.push({ enroll_number: enrollNumber, punch_time: `${dateStr} ${last.original_out_time}`, device_id: deviceId, is_deleted: false });
-      }
-      const { error: insErr } = await supabase.from('raw_punches').insert(inserts);
-      if (insErr) console.error('Restore insert error:', insErr);
-
-    } else {
-      console.log('[restorePunch] no actionable restore case found');
-    }
-
-    setCtxMenu(null);
-    await fetchData();
-    console.log('[restorePunch] done');
-    } catch (err) {
-      console.error('restorePunch crashed:', err);
-    }
-  }
+  
 
   // ─── Save Punch (Modify — add/edit with audit) ────────
   async function savePunch() {
@@ -575,22 +413,11 @@ export default function Attendance() {
     const emp = employees.find(e => e.enroll_number === enroll);
     const deviceId = emp?.primary_device_id || (devices.length > 0 ? devices[0].id : null);
 
-    // Log audit
-    const { error: auditErr } = await supabase.from('punch_modifications').insert({
-      enroll_number: enroll,
-      punch_date: dateStr,
-      action_type: 'modify',
-      original_in_time: originalIn || null,
-      original_out_time: originalOut || null,
-      new_in_time: inTime ? inTime + ':00' : null,
-      new_out_time: outTime ? outTime + ':00' : null,
-      modified_by: 'admin',
-    });
-    if (auditErr) console.error('Modify audit error:', auditErr);
+    // (Audit log logic removed as part of schema update)
 
     // Un-soft-delete first, then hard-delete all
     await supabase.from('raw_punches')
-      .update({ is_deleted: false })
+      .update({ is_deleted: false, deleted_at: null, deleted_by: null, delete_reason: null })
       .eq('enroll_number', enroll)
       .gte('punch_time', dateStr + ' 00:00:00')
       .lte('punch_time', dateStr + ' 23:59:59');
@@ -618,8 +445,7 @@ export default function Attendance() {
     e.preventDefault();
     e.stopPropagation();
     const cellKey = `${emp.enroll_number}:${day.dateStr}`;
-    const isModified = modSet.has(cellKey);
-    setCtxMenu({ x: e.clientX, y: e.clientY, enroll: emp.enroll_number, name: emp.name, dateStr: day.dateStr, day, isModified });
+    setCtxMenu({ x: e.clientX, y: e.clientY, enroll: emp.enroll_number, name: emp.name, dateStr: day.dateStr, day });
   }
 
   function openEditModal() {
@@ -635,15 +461,7 @@ export default function Attendance() {
     setCtxMenu(null);
   }
 
-  async function openDetailsModal(enroll, dateStr, name) {
-    const { data } = await supabase.from('punch_modifications')
-      .select('*')
-      .eq('enroll_number', enroll)
-      .eq('punch_date', dateStr)
-      .order('modified_at', { ascending: false });
-    setDetailsModal({ enroll, dateStr, name, logs: data || [] });
-    setCtxMenu(null);
-  }
+  
 
   // Close context menu on any click
   useEffect(() => {
@@ -1070,18 +888,14 @@ export default function Attendance() {
                       {/* Day cells */}
                       {emp.days.map(day => {
                         const cellKey = `${emp.enroll_number}:${day.dateStr}`;
-                        const override = localOverrides.get(cellKey);
 
-                        // Merge optimistic override with real data
-                        const dStatus = override ? override.status : day.status;
-                        const dCheckIn = override ? override.checkIn : day.checkIn;
-                        const dCheckOut = override ? override.checkOut : day.checkOut;
-                        const isPending = !!override;
+                        const dStatus = day.status;
+                        const dCheckIn = day.checkIn;
+                        const dCheckOut = day.checkOut;
 
                         const colors = getStatusColor(dStatus);
                         const isSelected = selectedCells.has(cellKey);
                         const isToday = day.dateStr === format(new Date(), 'yyyy-MM-dd');
-                        const isModified = modSet.has(cellKey) || isPending;
 
                         let cellContent;
                         if (dCheckIn && dCheckOut && dCheckIn !== dCheckOut) {
@@ -1176,23 +990,7 @@ export default function Attendance() {
             <UserX size={12} /> Mark as Absent
           </button>
 
-          {/* 4. Restore — disabled if not modified */}
-          <button
-            className={`ctx-item ctx-restore ${!ctxMenu.isModified ? 'ctx-disabled' : ''}`}
-            disabled={!ctxMenu.isModified}
-            onClick={() => ctxMenu.isModified && restorePunch(ctxMenu.enroll, ctxMenu.dateStr)}>
-            <RotateCcw size={12} /> Restore
-          </button>
-
-          {/* 5. Details — only if modified */}
-          {ctxMenu.isModified && (
-            <>
-              <div className="ctx-sep" />
-              <button className="ctx-item ctx-details" onClick={() => openDetailsModal(ctxMenu.enroll, ctxMenu.dateStr, ctxMenu.name)}>
-                <Info size={12} /> View Details
-              </button>
-            </>
-          )}
+          
         </div>
       )}
 
@@ -1266,54 +1064,7 @@ export default function Attendance() {
         </motion.div>
       )}</AnimatePresence>
 
-      {/* ── Details / Audit Trail Modal ── */}
-      <AnimatePresence>{detailsModal && (
-        <motion.div className="modal-overlay" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-          onClick={() => setDetailsModal(null)}>
-          <motion.div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 520 }}
-            initial={{ scale: 0.92, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.92, opacity: 0 }}>
-            <div className="modal-header">
-              <h3>Modification History</h3>
-              <button className="btn-icon" onClick={() => setDetailsModal(null)}><X size={16} /></button>
-            </div>
-            <div className="modal-body">
-              <p className="modal-sub">{detailsModal.name} — {format(parseISO(detailsModal.dateStr), 'EEEE, dd MMM yyyy')}</p>
-              {detailsModal.logs.length === 0 ? (
-                <p style={{ color: 'var(--text-3)', fontSize: '0.8rem', padding: '12px 0' }}>No modifications recorded.</p>
-              ) : (
-                <div className="audit-timeline">
-                  {detailsModal.logs.map((log, i) => (
-                    <div key={log.id} className="audit-entry">
-                      <div className={`audit-badge ${log.action_type}`}>
-                        {log.action_type === 'modify' && <Pencil size={10} />}
-                        {log.action_type === 'mark_present' && <UserCheck size={10} />}
-                        {log.action_type === 'mark_absent' && <UserX size={10} />}
-                        {log.action_type === 'restore' && <RotateCcw size={10} />}
-                        {log.action_type.replace('_', ' ')}
-                      </div>
-                      <div className="audit-meta">
-                        <span className="audit-by">by {log.modified_by}</span>
-                        <span className="audit-at">{format(new Date(log.modified_at), 'dd MMM yyyy, HH:mm')}</span>
-                      </div>
-                      <div className="audit-data">
-                        {log.original_in_time && (
-                          <span className="audit-old">Was: {log.original_in_time?.substring(0, 5)} — {log.original_out_time?.substring(0, 5) || '—'}</span>
-                        )}
-                        {log.new_in_time && (
-                          <span className="audit-new">→ {log.new_in_time?.substring(0, 5)} — {log.new_out_time?.substring(0, 5) || '—'}</span>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-            <div className="modal-footer">
-              <button className="btn btn-secondary" onClick={() => setDetailsModal(null)}>Close</button>
-            </div>
-          </motion.div>
-        </motion.div>
-      )}</AnimatePresence>
+      
 
       {/* ── Employee Profile (Slide-Over) ── */}
       <AnimatePresence>
@@ -1324,39 +1075,11 @@ export default function Attendance() {
             devices={devices}
             punches={punches}
             holidays={holidays}
-            rules={rules}
-            modifications={modifications}
             onClose={() => setProfileModal(null)}
           />
         )}
       </AnimatePresence>
-      {/* ── Sync Status Indicator ── */}
-      <AnimatePresence>
-        {syncStatus.active && (
-          <motion.div className="sync-toast"
-            initial={{ y: 80, opacity: 0, scale: 0.9 }}
-            animate={{ y: 0, opacity: 1, scale: 1 }}
-            exit={{ y: 80, opacity: 0, scale: 0.9 }}
-            transition={{ type: 'spring', stiffness: 400, damping: 30 }}>
-            {syncStatus.active === 'done' ? (
-              <>
-                <CheckCircle size={14} className="sync-icon-done" />
-                <span>All {syncStatus.total} changes synced{syncStatus.failed > 0 ? ` (${syncStatus.failed} failed)` : ''}!</span>
-              </>
-            ) : (
-              <>
-                <Loader size={14} className="sync-spinner" />
-                <span>Syncing {syncStatus.done}/{syncStatus.total} changes…</span>
-                <div className="sync-bar">
-                  <motion.div className="sync-bar-fill"
-                    animate={{ width: `${Math.round((syncStatus.done / syncStatus.total) * 100)}%` }}
-                    transition={{ ease: 'easeOut' }} />
-                </div>
-              </>
-            )}
-          </motion.div>
-        )}
-      </AnimatePresence>
+      {/* ── Sync Status Indicator Removed (Using Realtime) ── */}
     </>
   );
 }

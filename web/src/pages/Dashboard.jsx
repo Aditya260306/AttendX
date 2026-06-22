@@ -15,17 +15,16 @@ export default function Dashboard() {
 
   const fetchData = useCallback(async () => {
     try {
-      const [{ count: empCount }, todayRes, { count: totalPunches }, devRes, punchRes, syncRes, dailyRes] = await Promise.all([
-        supabase.from('employees').select('*', { count: 'exact', head: true }).eq('is_active', true),
+      const [{ count: empCount }, todayRes, { count: totalPunches }, devRes, punchRes, syncRes] = await Promise.all([
+        supabase.from('employees').select('*', { count: 'exact', head: true }).eq('is_deleted', false),
         supabase.from('raw_punches').select('enroll_number').gte('punch_time', format(new Date(), 'yyyy-MM-dd') + ' 00:00:00'),
         supabase.from('raw_punches').select('*', { count: 'exact', head: true }),
         supabase.from('devices').select('*').eq('is_active', true).order('id'),
         supabase.from('raw_punches').select('*, employees(name, department)').order('punch_time', { ascending: false }).limit(8),
-        supabase.from('sync_history').select('*').order('created_at', { ascending: false }).limit(5),
-        supabase.from('daily_attendance').select('is_late').eq('work_date', format(new Date(), 'yyyy-MM-dd')),
+        supabase.from('device_commands').select('*, devices(name)').order('created_at', { ascending: false }).limit(5),
       ]);
       const unique = new Set((todayRes.data || []).map(p => p.enroll_number));
-      setStats({ totalEmployees: empCount || 0, presentToday: unique.size, absentToday: Math.max(0, (empCount || 0) - unique.size), lateToday: (dailyRes.data || []).filter(d => d.is_late).length, totalPunches: totalPunches || 0 });
+      setStats({ totalEmployees: empCount || 0, presentToday: unique.size, absentToday: Math.max(0, (empCount || 0) - unique.size), lateToday: 0, totalPunches: totalPunches || 0 });
       setDevices(devRes.data || []);
       setRecentPunches(punchRes.data || []);
       setRecentSync(syncRes.data || []);
@@ -33,7 +32,20 @@ export default function Dashboard() {
     finally { setLoading(false); }
   }, []);
 
-  useEffect(() => { fetchData(); const i = setInterval(fetchData, 30000); return () => clearInterval(i); }, [fetchData]);
+  useEffect(() => {
+    fetchData();
+    
+    // Subscribe to key tables for live dashboard updates
+    const channel = supabase.channel('dashboard_realtime')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'raw_punches' }, fetchData)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'device_commands' }, fetchData)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'devices' }, fetchData)
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [fetchData]);
 
   const statCards = [
     { label: 'Total Employees', value: stats.totalEmployees, icon: Users, color: 'purple' },
@@ -110,14 +122,16 @@ export default function Dashboard() {
             <div className="card-header"><h3 className="card-title">Sync Activity</h3></div>
             {recentSync.length === 0 ? <div className="empty-state"><RefreshCw className="icon" /><p className="message">No sync activity yet</p></div>
             : <table className="data-table"><thead><tr><th>Device</th><th>Action</th><th>Status</th><th>Time</th></tr></thead>
-              <tbody>{recentSync.map(s => (
+              <tbody>{recentSync.map(s => {
+                const actionLabel = s.command_type.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+                return (
                 <tr key={s.id}>
-                  <td style={{ color: 'var(--text)', fontWeight: 500 }}>{s.device_name || '—'}</td>
-                  <td><span className="badge purple">{s.action}</span></td>
-                  <td><span className={`badge ${s.status === 'success' ? 'green' : 'red'}`}>{s.status}</span></td>
+                  <td style={{ color: 'var(--text)', fontWeight: 500 }}>{s.devices?.name || '—'}</td>
+                  <td><span className="badge purple">{actionLabel}</span></td>
+                  <td><span className={`badge ${s.status === 'completed' ? 'green' : s.status === 'failed' ? 'red' : 'gray'}`}>{s.status}</span></td>
                   <td style={{ fontFamily: 'Consolas, monospace', fontSize: '0.76rem' }}>{format(new Date(s.created_at), 'HH:mm:ss')}</td>
                 </tr>
-              ))}</tbody></table>}
+              )})}</tbody></table>}
           </div>
         </motion.div>
       </div>

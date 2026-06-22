@@ -12,7 +12,8 @@ dist
 dist-ssr
 *.local
 ./agent
-
+./migrations
+./adms-server
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

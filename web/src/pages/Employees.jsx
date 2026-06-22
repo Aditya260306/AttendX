@@ -114,38 +114,27 @@ export default function Employees() {
 
   async function handleDelete(id) {
     const emp = employees.find(e => e.enroll_number === id);
-    if (!confirm(`Deactivate ${emp?.name || '#' + id}? Records will be preserved.`)) return;
-    await supabase.from('employees')
-      .update({ is_active: false, status: 'Inactive' })
-      .eq('enroll_number', id);
-    await supabase.from('employee_archive_log').insert({
-      enroll_number: id,
-      employee_name: emp?.name || `#${id}`,
-      action: 'deactivated',
-      reason: 'Manually deactivated from Employees page',
-      performed_by: 'dashboard',
-    }).catch(() => {}); // ignore if table doesn't exist yet
+    if (!confirm(`Deactivate and remove ${emp?.name || '#' + id} from all devices?`)) return;
+    
+    // 1. Soft delete the employee
+    await supabase.from('employees').update({ is_deleted: true }).eq('enroll_number', id);
+    
+    // 2. Queue delete_user command for all devices this user is on
+    const empDevs = getEmpDevices(id);
+    for (const ed of empDevs) {
+      await supabase.from('device_commands').insert({
+        device_id: ed.device_id,
+        command_type: 'delete_user',
+        payload: { enroll_number: id }
+      });
+    }
+    
     fetchAll();
   }
 
+  // Deprecated toggleActive, use handleDelete instead for soft-deletes
   async function toggleActive(emp) {
-    const newStatus = !emp.is_active;
-    setEmployees(prev => prev.map(e =>
-      e.enroll_number === emp.enroll_number
-        ? { ...e, is_active: newStatus, status: newStatus ? 'Active' : 'Inactive' }
-        : e
-    ));
-    const { error } = await supabase.from('employees')
-      .update({ is_active: newStatus, status: newStatus ? 'Active' : 'Inactive' })
-      .eq('enroll_number', emp.enroll_number);
-    if (error) {
-      console.error('toggleActive failed:', error);
-      setEmployees(prev => prev.map(e =>
-        e.enroll_number === emp.enroll_number
-          ? { ...e, is_active: emp.is_active, status: emp.status }
-          : e
-      ));
-    }
+    console.warn("toggleActive is deprecated. Use handleDelete to soft-delete.");
   }
 
   async function toggleTrackAttendance(emp) {
@@ -166,31 +155,15 @@ export default function Employees() {
 
   async function togglePrivilege(emp) {
     const newPriv = emp.privilege === 14 ? 0 : 14;
-    setEmployees(prev => prev.map(e =>
-      e.enroll_number === emp.enroll_number ? { ...e, privilege: newPriv } : e
-    ));
-    const { error } = await supabase.from('employees')
-      .update({ privilege: newPriv })
-      .eq('enroll_number', emp.enroll_number);
-    if (error) {
-      console.error('togglePrivilege failed:', error);
-      setEmployees(prev => prev.map(e =>
-        e.enroll_number === emp.enroll_number ? { ...e, privilege: emp.privilege } : e
-      ));
-      return;
-    }
-    // Only push to devices where this employee ACTUALLY EXISTS
+    setEmployees(prev => prev.map(e => e.enroll_number === emp.enroll_number ? { ...e, privilege: newPriv } : e));
+    await supabase.from('employees').update({ privilege: newPriv }).eq('enroll_number', emp.enroll_number);
+    
     const empDevs = getEmpDevices(emp.enroll_number);
     for (const ed of empDevs) {
       await supabase.from('device_commands').insert({
         device_id: ed.device_id,
         command_type: 'add_user',
-        payload: {
-          enroll_number: emp.enroll_number,
-          name: emp.name,
-          privilege: newPriv,
-          transport: 'adms',
-        },
+        payload: { enroll_number: emp.enroll_number, name: emp.name, privilege: newPriv, cardNumber: 0 },
         created_by: 'dashboard',
       });
     }
@@ -286,8 +259,6 @@ export default function Employees() {
         bank_ifsc: map.bank_ifsc ? map.bank_ifsc.toUpperCase() : null,
         bank_name: map.bank_name || null,
         track_attendance: true,
-        is_active: true,
-        status: 'Active',
       });
     }
     return { rows, errors };
@@ -339,13 +310,11 @@ export default function Employees() {
   async function openProfile(enrollNumber) {
     setEmpMenu(null);
     setProfileModal({ enrollNumber });
-    const [{ data: p }, { data: h }, { data: r }, { data: m }] = await Promise.all([
+    const [{ data: p }, { data: h }] = await Promise.all([
       supabase.from('raw_punches').select('*').eq('enroll_number', enrollNumber),
       supabase.from('holidays').select('*'),
-      supabase.from('attendance_rules').select('*').single(),
-      supabase.from('punch_modifications').select('*').eq('enroll_number', enrollNumber).order('modified_at', { ascending: false }),
     ]);
-    setProfileData({ punches: p || [], holidays: h || [], rules: r, modifications: m || [] });
+    setProfileData({ punches: p || [], holidays: h || [], rules: null, modifications: [] });
   }
 
   // Dynamic department list from actual data
@@ -378,8 +347,8 @@ export default function Employees() {
   // Multi-criteria filter + sort
   const filtered = useMemo(() => {
     let result = employees.filter(e => {
-      if (filterStatus === 'active' && !e.is_active) return false;
-      if (filterStatus === 'inactive' && e.is_active) return false;
+      if (filterStatus === 'active' && e.is_deleted) return false;
+      if (filterStatus === 'inactive' && !e.is_deleted) return false;
       if (filterDept !== 'all' && (e.department || '') !== filterDept) return false;
       if (filterRole === 'admin' && e.privilege !== 14) return false;
       if (filterRole === 'user' && e.privilege === 14) return false;
@@ -409,8 +378,8 @@ export default function Employees() {
   // KPI stats
   const kpi = useMemo(() => ({
     total: employees.length,
-    active: employees.filter(e => e.is_active).length,
-    inactive: employees.filter(e => !e.is_active).length,
+    active: employees.filter(e => !e.is_deleted).length,
+    inactive: employees.filter(e => e.is_deleted).length,
     admins: employees.filter(e => e.privilege === 14).length,
     tracking: employees.filter(e => e.track_attendance !== false).length,
   }), [employees]);
@@ -603,7 +572,7 @@ export default function Employees() {
                       return (
                         <motion.div
                           key={e.enroll_number}
-                          className={`emp-card ${!e.is_active ? 'inactive' : ''}`}
+                          className={`emp-card ${e.is_deleted ? 'inactive' : ''}`}
                           initial={{ opacity: 0, y: 12 }}
                           animate={{ opacity: 1, y: 0 }}
                           transition={{ delay: i * 0.03 }}
@@ -744,7 +713,7 @@ export default function Employees() {
                           return (
                             <motion.tr key={e.enroll_number}
                               initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: i * 0.02 }}
-                              style={{ opacity: e.is_active ? 1 : 0.45 }}>
+                              style={{ opacity: !e.is_deleted ? 1 : 0.45 }}>
 
                               <td style={{ fontWeight: 700, color: 'var(--accent)', fontSize: '0.82rem' }}>#{e.enroll_number}</td>
                               <td style={{ color: 'var(--text)', fontWeight: 600 }}>{e.name}</td>
